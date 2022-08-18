@@ -29,6 +29,7 @@ import autosklearn.pipeline.util as putil
 from autosklearn.automl import AutoMLClassifier
 from autosklearn.data.validation import InputValidator
 from autosklearn.ensemble_building.run import Run
+from autosklearn.ensembles import EnsembleSelection, MultiObjectiveDummyEnsemble
 from autosklearn.estimators import (
     AutoSklearnClassifier,
     AutoSklearnEstimator,
@@ -1712,13 +1713,8 @@ def test_autosklearn_anneal(as_frame):
     "dataset_compression", [False, True, {"memory_allocation": 0.2}]
 )
 def test_param_dataset_compression(dataset_compression: Union[bool, Dict[str, Any]]):
-    """We expect this does not get parsed and modified until it gets to the AutoML class,
-    In the meantime, it's value remains whatever was passed in.
-
-    Parameters
-    ----------
-    dataset_compression: Union[bool, Dict[str, Any]
-        The arg to pass to the estimator
+    """We expect this does not get parsed and modified until it gets to the AutoML
+    class, In the meantime, it's value remains whatever was passed in.
 
     Expects
     -------
@@ -1727,3 +1723,16 @@ def test_param_dataset_compression(dataset_compression: Union[bool, Dict[str, An
     model = AutoSklearnClassifier(dataset_compression=dataset_compression)
 
     assert model.dataset_compression == dataset_compression
+
+
+def test_ensemble_default_resolves():
+    model = AutoSklearnClassifier(
+        ensemble_class="default",
+        metric=accuracy,
+    )
+    assert model.ensemble_class == EnsembleSelection
+    model = AutoSklearnClassifier(
+        ensemble_class="default",
+        metric=[accuracy, f1_macro],
+    )
+    assert model.ensemble_class == MultiObjectiveDummyEnsemble

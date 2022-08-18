@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TypeVar, Union, cast
 
 import copy
 import json
@@ -67,6 +67,14 @@ def _get_y_array(y: SUPPORTED_TARGET_TYPES, task_type: int) -> SUPPORTED_TARGET_
         return y
 
 
+T = TypeVar("T", SUPPORTED_FEAT_TYPES, SUPPORTED_TARGET_TYPES)
+
+
+def select(data: T, indices: np.ndarray) -> T:
+    """Select into some data by indices"""
+    return data.iloc[indices] if hasattr(data, "iloc") else data[indices]
+
+
 def subsample_indices(
     train_indices: List[int],
     subsample: Optional[float],
@@ -86,11 +94,7 @@ def subsample_indices(
         # required to subsample because otherwise scikit-learn will complain
 
         if task_type in CLASSIFICATION_TASKS and task_type != MULTILABEL_CLASSIFICATION:
-            stratify: Optional[SUPPORTED_TARGET_TYPES] = (
-                Y_train.iloc[train_indices]
-                if hasattr(Y_train, "iloc")
-                else Y_train[train_indices]
-            )
+            stratify: Optional[SUPPORTED_TARGET_TYPES] = select(Y_train, train_indices)
         else:
             stratify = None
 
@@ -118,50 +122,24 @@ def _fit_with_budget(
     train_indices: List[int],
     task_type: int,
 ) -> None:
-    if (
-        budget_type == "iterations"
-        or budget_type == "mixed"
-        and model.estimator_supports_iterative_fit()
+    if budget_type == "iterations" or (
+        budget_type == "mixed" and model.estimator_supports_iterative_fit()
     ):
+        X = select(X_train, train_indices)
+        y = select(Y_train, train_indices)
+
         if model.estimator_supports_iterative_fit():
             budget_factor = model.get_max_iter()
-            Xt, fit_params = model.fit_transformer(
-                X_train.iloc[train_indices]
-                if hasattr(X_train, "iloc")
-                else X_train[train_indices],
-                Y_train.iloc[train_indices]
-                if hasattr(Y_train, "iloc")
-                else Y_train[train_indices],
-            )
+            Xt, fit_params = model.fit_transformer(X, y)
 
             n_iter = int(np.ceil(budget / 100 * budget_factor))
-            model.iterative_fit(
-                Xt,
-                Y_train.iloc[train_indices]
-                if hasattr(Y_train, "iloc")
-                else Y_train[train_indices],
-                n_iter=n_iter,
-                refit=True,
-                **fit_params,
-            )
+            model.iterative_fit(Xt, y, n_iter=n_iter, refit=True, **fit_params)
         else:
-            _fit_and_suppress_warnings(
-                logger,
-                model,
-                X_train.iloc[train_indices]
-                if hasattr(X_train, "iloc")
-                else X_train[train_indices],
-                Y_train.iloc[train_indices]
-                if hasattr(Y_train, "iloc")
-                else Y_train[train_indices],
-            )
+            _fit_and_suppress_warnings(logger, model, X, y)
 
-    elif (
-        budget_type == "subsample"
-        or budget_type == "mixed"
-        and not model.estimator_supports_iterative_fit()
+    elif budget_type == "subsample" or (
+        budget_type == "mixed" and not model.estimator_supports_iterative_fit()
     ):
-
         subsample = budget / 100
         train_indices_subset = subsample_indices(
             train_indices,
@@ -169,12 +147,9 @@ def _fit_with_budget(
             task_type,
             Y_train,
         )
-        _fit_and_suppress_warnings(
-            logger,
-            model,
-            X_train[train_indices_subset],
-            Y_train[train_indices_subset],
-        )
+        X = select(X_train, train_indices_subset)
+        y = select(Y_train, train_indices_subset)
+        _fit_and_suppress_warnings(logger, model, X, y)
 
     else:
         raise ValueError(budget_type)
@@ -247,6 +222,7 @@ class TrainEvaluator(AbstractEvaluator):
             budget_type=budget_type,
         )
 
+        self.feat_type = self.backend.load_datamanager().feat_type
         self.resampling_strategy = resampling_strategy
         if resampling_strategy_args is None:
             self.resampling_strategy_args = {}
@@ -288,13 +264,9 @@ class TrainEvaluator(AbstractEvaluator):
                     self.Y_train,
                     groups=self.resampling_strategy_args.get("groups"),
                 ):
-                    self.X_optimization = (
-                        self.X_train.iloc[test_split]
-                        if hasattr(self.X_train, "iloc")
-                        else self.X_train[test_split]
-                    )
-                    self.Y_optimization = self.Y_train[test_split]
-                    self.Y_actual_train = self.Y_train[train_split]
+                    self.X_optimization = select(self.X_train, test_split)
+                    self.Y_optimization = select(self.Y_train, test_split)
+                    self.Y_actual_train = select(self.Y_train, train_split)
                     self._partial_fit_and_predict_iterative(
                         0,
                         train_indices=train_split,
@@ -305,7 +277,7 @@ class TrainEvaluator(AbstractEvaluator):
 
                 # Test if the model allows for an iterative fit, if not,
                 # call this method again without the iterative argument
-                model = self._get_model()
+                model = self._get_model(self.feat_type)
                 if not model.estimator_supports_iterative_fit():
                     self.fit_predict_and_loss(iterative=False)
                     return
@@ -319,7 +291,9 @@ class TrainEvaluator(AbstractEvaluator):
                 Y_test_pred = [None] * self.num_cv_folds
                 train_splits = [None] * self.num_cv_folds
 
-                self.models = [self._get_model() for i in range(self.num_cv_folds)]
+                self.models = [
+                    self._get_model(self.feat_type) for i in range(self.num_cv_folds)
+                ]
                 iterations = [1] * self.num_cv_folds
                 total_n_iterations = [0] * self.num_cv_folds
                 # model.estimator_supports_iterative_fit -> true
@@ -381,37 +355,27 @@ class TrainEvaluator(AbstractEvaluator):
                         model = self.models[i]
 
                         if iterations[i] == 1:
-                            self.Y_train_targets[train_indices] = (
-                                self.Y_train.iloc[train_indices]
-                                if hasattr(self.Y_train, "iloc")
-                                else self.Y_train[train_indices]
+                            self.Y_train_targets[train_indices] = select(
+                                self.Y_train, train_indices
                             )
-                            self.X_targets[i] = (
-                                self.X_train.iloc[test_indices]
-                                if hasattr(self.X_train, "iloc")
-                                else self.X_train[train_indices]
-                            )
+                            self.X_targets[i] = select(self.X_train, test_indices)
+                            self.Y_targets[i] = select(self.Y_train, test_indices)
 
-                            self.Y_targets[i] = self.Y_train[test_indices]
-
+                            # Note: Be careful moving these into variables, caused a
+                            # headache when trying to debug why things were breaking
                             Xt, fit_params = model.fit_transformer(
-                                self.X_train.iloc[train_indices]
-                                if hasattr(self.X_train, "iloc")
-                                else self.X_train[train_indices],
-                                self.Y_train.iloc[train_indices]
-                                if hasattr(self.Y_train, "iloc")
-                                else self.Y_train[train_indices],
+                                select(self.X_train, train_indices),
+                                select(self.Y_train, train_indices),
                             )
                             Xt_array[i] = Xt
                             fit_params_array[i] = fit_params
+
                         n_iter = int(2 ** iterations[i] / 2) if iterations[i] > 1 else 2
                         total_n_iterations[i] = total_n_iterations[i] + n_iter
 
                         model.iterative_fit(
                             Xt_array[i],
-                            self.Y_train.iloc[train_indices]
-                            if hasattr(self.Y_train, "iloc")
-                            else self.Y_train[train_indices],
+                            select(self.Y_train, train_indices),
                             n_iter=n_iter,
                             **fit_params_array[i],
                         )
@@ -428,9 +392,7 @@ class TrainEvaluator(AbstractEvaluator):
                         train_splits[i] = train_indices
 
                         train_loss = self._loss(
-                            self.Y_train.iloc[train_indices]
-                            if hasattr(self.Y_train, "iloc")
-                            else self.Y_train[train_indices],
+                            select(self.Y_train, train_indices),
                             train_pred,
                             X_data=Xt_array[i],
                         )
@@ -515,7 +477,7 @@ class TrainEvaluator(AbstractEvaluator):
                     self.Y_optimization = Y_targets
                     self.Y_actual_train = Y_train_targets
 
-                    self.model = self._get_model()
+                    self.model = self._get_model(self.feat_type)
                     status = StatusType.DONOTADVANCE
                     if any(
                         [
@@ -605,13 +567,10 @@ class TrainEvaluator(AbstractEvaluator):
                 Y_test_pred[i] = test_pred
                 train_splits[i] = train_split
 
-                train_loss = self._loss(
-                    self.Y_train_targets[train_split],
-                    train_pred,
-                    X_data=self.X_train.iloc[train_split]
-                    if hasattr(self.X_train, "iloc")
-                    else self.X_train[train_split],
-                )
+                X = select(self.X_train, train_split)
+                y = select(self.Y_train_targets, train_split)
+
+                train_loss = self._loss(y, train_pred, X_data=X)
                 train_losses.append(train_loss)
                 # number of training data points for this fold. Used for weighting
                 # the average.
@@ -619,7 +578,9 @@ class TrainEvaluator(AbstractEvaluator):
 
                 # Compute validation loss of this fold and store it.
                 optimization_loss = self._loss(
-                    self.Y_targets[i], opt_pred, X_data=self.X_targets[i]
+                    self.Y_targets[i],
+                    opt_pred,
+                    X_data=self.X_targets[i],
                 )
                 opt_losses.append(optimization_loss)
                 # number of optimization data points for this fold. Used for weighting
@@ -679,7 +640,7 @@ class TrainEvaluator(AbstractEvaluator):
             self.Y_actual_train = Y_train_targets
 
             if self.num_cv_folds > 1:
-                self.model = self._get_model()
+                self.model = self._get_model(self.feat_type)
                 # Bad style, but necessary for unit testing that self.model is
                 # actually a new model
                 self._added_empty_model = True
@@ -742,9 +703,9 @@ class TrainEvaluator(AbstractEvaluator):
                 break
 
         if self.num_cv_folds > 1:
-            self.X_optimization = self.X_train[test_split]
-            self.Y_optimization = self.Y_train[test_split]
-            self.Y_actual_train = self.Y_train[train_split]
+            self.X_optimization = select(self.X_train, test_split)
+            self.Y_optimization = select(self.Y_train, test_split)
+            self.Y_actual_train = select(self.Y_train, train_split)
 
         if iterative:
             self._partial_fit_and_predict_iterative(
@@ -767,8 +728,12 @@ class TrainEvaluator(AbstractEvaluator):
                 test_indices=test_split,
                 add_model_to_self=True,
             )
-            train_loss = self._loss(self.Y_actual_train, train_pred)
-            loss = self._loss(self.Y_targets[fold], opt_pred)
+
+            # This is my best guess at what the X_data for these should be
+            X_train = select(self.X_train, train_split)  # From above (only cv?)
+            X_fold = self.X_targets[fold]
+            train_loss = self._loss(self.Y_actual_train, train_pred, X_data=X_train)
+            loss = self._loss(self.Y_targets[fold], opt_pred, X_data=X_fold)
 
             if self.model.estimator_supports_iterative_fit():
                 model_max_iter = self.model.get_max_iter()
@@ -798,7 +763,7 @@ class TrainEvaluator(AbstractEvaluator):
         test_indices: List[int],
         add_model_to_self: bool,
     ) -> None:
-        model = self._get_model()
+        model = self._get_model(self.feat_type)
 
         self.indices[fold] = (train_indices, test_indices)
 
@@ -808,20 +773,15 @@ class TrainEvaluator(AbstractEvaluator):
         file_output = True if self.num_cv_folds == 1 else False
 
         if model.estimator_supports_iterative_fit():
-            Xt, fit_params = model.fit_transformer(
-                self.X_train.iloc[train_indices]
-                if hasattr(self.Y_train, "iloc")
-                else self.X_train[train_indices],
-                self.Y_train.iloc[train_indices]
-                if hasattr(self.Y_train, "iloc")
-                else self.Y_train[train_indices],
-            )
+            X = select(self.X_train, train_indices)
+            y = select(self.Y_train, train_indices)
 
-            self.Y_train_targets[train_indices] = (
-                self.Y_train.iloc[train_indices]
-                if hasattr(self.Y_train, "iloc")
-                else self.Y_train[train_indices]
-            )
+            X_test = select(self.X_train, test_indices)
+            y_test = select(self.Y_train, test_indices)
+
+            Xt, fit_params = model.fit_transformer(X, y)
+
+            self.Y_train_targets[train_indices] = y
 
             iteration = 1
             total_n_iteration = 0
@@ -839,14 +799,8 @@ class TrainEvaluator(AbstractEvaluator):
             ):
                 n_iter = int(2**iteration / 2) if iteration > 1 else 2
                 total_n_iteration += n_iter
-                model.iterative_fit(
-                    Xt,
-                    self.Y_train.iloc[train_indices]
-                    if hasattr(self.Y_train, "iloc")
-                    else self.Y_train[train_indices],
-                    n_iter=n_iter,
-                    **fit_params,
-                )
+                model.iterative_fit(Xt, y, n_iter=n_iter, **fit_params)
+
                 (Y_train_pred, Y_optimization_pred, Y_test_pred,) = self._predict(
                     model,
                     train_indices=train_indices,
@@ -856,13 +810,9 @@ class TrainEvaluator(AbstractEvaluator):
                 if add_model_to_self:
                     self.model = model
 
-                train_loss = self._loss(
-                    self.Y_train.iloc[train_indices]
-                    if hasattr(self.Y_train, "iloc")
-                    else self.Y_train[train_indices],
-                    Y_train_pred,
-                )
-                loss = self._loss(self.Y_train[test_indices], Y_optimization_pred)
+                train_loss = self._loss(y, Y_train_pred, X_data=X)
+                loss = self._loss(y_test, Y_optimization_pred, X_data=X_test)
+
                 additional_run_info = model.get_additional_run_info()
 
                 model_current_iter = model.get_current_iter()
@@ -899,13 +849,15 @@ class TrainEvaluator(AbstractEvaluator):
             ) = self._partial_fit_and_predict_standard(
                 fold, train_indices, test_indices, add_model_to_self
             )
-            train_loss = self._loss(
-                self.Y_train.iloc[train_indices]
-                if hasattr(self.Y_train, "iloc")
-                else self.Y_train[train_indices],
-                Y_train_pred,
-            )
-            loss = self._loss(self.Y_train[test_indices], Y_optimization_pred)
+
+            X = select(self.X_train, train_indices)
+            y = select(self.Y_train, train_indices)
+            train_loss = self._loss(y, Y_train_pred, X_data=X)
+
+            X_test = select(self.X_train, test_indices)
+            y_test = select(self.Y_train, test_indices)
+            loss = self._loss(y_test, Y_optimization_pred, X_data=X_test)
+
             if self.model.estimator_supports_iterative_fit():
                 model_max_iter = self.model.get_max_iter()
                 model_current_iter = self.model.get_current_iter()
@@ -939,41 +891,22 @@ class TrainEvaluator(AbstractEvaluator):
         PIPELINE_DATA_DTYPE,  # test_pred
         TYPE_ADDITIONAL_INFO,
     ]:
-        model = self._get_model()
+        model = self._get_model(self.feat_type)
 
         self.indices[fold] = (train_indices, test_indices)
 
-        _fit_and_suppress_warnings(
-            self.logger,
-            model,
-            self.X_train.iloc[train_indices]
-            if hasattr(self.X_train, "iloc")
-            else self.X_train[train_indices],
-            self.Y_train.iloc[train_indices]
-            if hasattr(self.Y_train, "iloc")
-            else self.Y_train[train_indices],
-        )
+        X = select(self.X_train, train_indices)
+        y = select(self.Y_train, train_indices)
+        _fit_and_suppress_warnings(self.logger, model, X, y)
 
         if add_model_to_self:
             self.model = model
         else:
             self.models[fold] = model
 
-        self.X_targets[fold] = (
-            self.X_train.iloc[test_indices]
-            if hasattr(self.X_train, "iloc")
-            else self.X_train[test_indices]
-        )
-        self.Y_targets[fold] = (
-            self.Y_train.iloc[test_indices]
-            if hasattr(self.Y_train, "iloc")
-            else self.Y_train[test_indices]
-        )
-        self.Y_train_targets[train_indices] = (
-            self.Y_train.iloc[train_indices]
-            if hasattr(self.Y_train, "iloc")
-            else self.Y_train[train_indices]
-        )
+        self.X_targets[fold] = select(self.X_train, test_indices)
+        self.Y_targets[fold] = select(self.Y_train, test_indices)
+        self.Y_train_targets[train_indices] = select(self.Y_train, train_indices)
 
         train_pred, opt_pred, test_pred = self._predict(
             model=model,
@@ -1005,15 +938,11 @@ class TrainEvaluator(AbstractEvaluator):
         # Add this statement for mypy
         assert self.budget is not None
 
-        model = self._get_model()
+        model = self._get_model(self.feat_type)
         self.indices[fold] = (train_indices, test_indices)
-        self.X_targets[fold] = self.X_train[test_indices]
-        self.Y_targets[fold] = self.Y_train[test_indices]
-        self.Y_train_targets[train_indices] = (
-            self.Y_train.iloc[train_indices]
-            if hasattr(self.Y_train, "iloc")
-            else self.Y_train[train_indices],
-        )
+        self.X_targets[fold] = select(self.X_train, test_indices)
+        self.Y_targets[fold] = select(self.Y_train, test_indices)
+        self.Y_train_targets[train_indices] = select(self.Y_train, train_indices)
 
         _fit_with_budget(
             X_train=self.X_train,
@@ -1048,38 +977,20 @@ class TrainEvaluator(AbstractEvaluator):
     def _predict(
         self, model: BaseEstimator, test_indices: List[int], train_indices: List[int]
     ) -> Tuple[PIPELINE_DATA_DTYPE, PIPELINE_DATA_DTYPE, PIPELINE_DATA_DTYPE]:
-        train_pred = self.predict_function(
-            self.X_train.iloc[train_indices]
-            if hasattr(self.X_train, "iloc")
-            else self.X_train[train_indices],
-            model,
-            self.task_type,
-            self.Y_train.iloc[train_indices]
-            if hasattr(self.Y_train, "iloc")
-            else self.Y_train[train_indices],
-        )
+        y_train = select(self.Y_train, train_indices)
+        X_train = select(self.X_train, train_indices)
+        X_test = select(self.X_train, test_indices)
 
-        opt_pred = self.predict_function(
-            self.X_train.iloc[test_indices]
-            if hasattr(self.X_train, "iloc")
-            else self.X_train[test_indices],
-            model,
-            self.task_type,
-            self.Y_train.iloc[train_indices]
-            if hasattr(self.Y_train, "iloc")
-            else self.Y_train[train_indices],
-        )
+        # The y_train here does not correspond to the X, there to ensure output shape
+        # will be correct in case labels were missing from some split
+        train_pred = self.predict_function(X_train, model, self.task_type, y_train)
+        opt_pred = self.predict_function(X_test, model, self.task_type, y_train)
 
+        # This is the test data the user can pass in
         if self.X_test is not None:
-            X_test = self.X_test.copy()
-            test_pred = self.predict_function(
-                X_test,
-                model,
-                self.task_type,
-                self.Y_train.iloc[train_indices]
-                if hasattr(self.Y_train, "iloc")
-                else self.Y_train[train_indices],
-            )
+            # See comment above about y_train
+            X_user = self.X_test.copy()
+            test_pred = self.predict_function(X_user, model, self.task_type, y_train)
         else:
             test_pred = None
 

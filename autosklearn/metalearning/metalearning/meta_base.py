@@ -3,6 +3,7 @@ from collections import OrderedDict
 import numpy as np
 import pandas as pd
 from ConfigSpace.configuration_space import Configuration
+from ConfigSpace.util import deactivate_inactive_hyperparameters
 
 from ..input import aslib_simple
 from ..metafeatures.metafeature import DatasetMetafeatures
@@ -40,9 +41,14 @@ class MetaBase(object):
         self.logger = logger
 
         self.configuration_space = configuration_space
+        self.default_configuration_space_dict = (
+            configuration_space.get_default_configuration().get_dictionary()
+        )
         self.aslib_directory = aslib_directory
 
-        aslib_reader = aslib_simple.AlgorithmSelectionProblem(self.aslib_directory)
+        aslib_reader = aslib_simple.AlgorithmSelectionProblem(
+            self.aslib_directory, self.configuration_space
+        )
         self.metafeatures = aslib_reader.metafeatures
         self.algorithm_runs: OrderedDict[
             str, pd.DataFrame
@@ -53,9 +59,18 @@ class MetaBase(object):
         for algorithm_id in self.configurations:
             configuration = self.configurations[algorithm_id]
             try:
-                configurations[str(algorithm_id)] = Configuration(
-                    configuration_space, values=configuration
+                for key in self.default_configuration_space_dict.keys():
+                    if key not in configuration:
+                        configuration[key] = self.default_configuration_space_dict[key]
+                configuration = Configuration(
+                    configuration_space,
+                    values=configuration,
+                    allow_inactive_with_values=True,
                 )
+                configuration = deactivate_inactive_hyperparameters(
+                    configuration, configuration_space
+                )
+                configurations[str(algorithm_id)] = configuration
             except (ValueError, KeyError) as e:
                 self.logger.debug("Error reading configurations: %s", e)
 
